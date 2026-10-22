@@ -8,6 +8,7 @@ use bible_core::{BookId, VerseRef};
 
 use super::{Empty, PageEnv, Tone, text};
 use crate::actions::Action;
+use crate::book_filter;
 use crate::icons;
 use crate::theme;
 use crate::widgets::{self, Button, Kind, css_baseline, flow, paint_runs};
@@ -38,7 +39,7 @@ impl State {
         };
 
         let all = env.study.highlights_dated();
-        let mut books: Vec<BookId> = all.iter().map(|(v, _, _)| v.book).collect();
+        let mut books: Vec<BookId> = all.iter().map(|(v, _)| v.book).collect();
         books.sort();
         books.dedup();
         let subtitle = match (all.len(), books.len()) {
@@ -79,34 +80,42 @@ impl State {
         let select = Rect::from_min_size(pos2(seg.left() - 8.0 - 160.0, cy - 16.0), vec2(160.0, 32.0));
         let value = self.book.map(book_name).unwrap_or_else(|| "All books".into());
         let resp = widgets::select_field(ui, p, select, &value, Some(icons::book), ui.id().with("book"));
-        crate::menu::popup(&resp, p).show(|ui| {
-            ui.set_min_width(180.0);
-            if ui.selectable_label(self.book.is_none(), "All books").clicked() {
-                self.book = None;
+        let filter = book_filter::Books {
+            current: self.book,
+            here: None,
+            listed: &books,
+            searchable: &books,
+            name: &book_name,
+            width: 180.0,
+        };
+        match book_filter::show(&resp, p, filter) {
+            Some(book_filter::Pick::All) => self.book = None,
+            Some(book_filter::Pick::Book(b)) => {
+                self.book = Some(b);
+                self.testament = 0;
             }
-            crate::menu::separator(ui);
-            for b in &books {
-                if ui.selectable_label(self.book == Some(*b), book_name(*b)).clicked() {
-                    self.book = Some(*b);
-                    self.testament = 0;
-                }
-            }
-        });
+            None => {}
+        }
 
         // What's shown, before the colour filter (so the tabs count what they'd show).
         let q = env.query.trim().to_lowercase();
         let verse_text =
             |v: VerseRef| t.as_ref().and_then(|t| t.find(v)).map(|v| v.plain_text()).unwrap_or_default();
-        let scoped: Vec<(VerseRef, HighlightColor, i64, String)> = all
+        // A card per highlight: part of a verse shows the words it covers.
+        let scoped: Vec<(VerseRef, HighlightColor, i64, String, u32)> = all
             .iter()
-            .filter(|(v, _, _)| match self.testament {
+            .filter(|(v, _)| match self.testament {
                 1 => v.book.0 < bible_core::books::FIRST_NT_BOOK.0,
                 2 => v.book.0 >= bible_core::books::FIRST_NT_BOOK.0,
                 _ => true,
             })
-            .filter(|(v, _, _)| self.book.is_none_or(|b| v.book == b))
-            .map(|(v, c, t)| (*v, *c, *t, verse_text(*v)))
-            .filter(|(v, _, _, text)| {
+            .filter(|(v, _)| self.book.is_none_or(|b| v.book == b))
+            .map(|(v, h)| {
+                let text = verse_text(*v);
+                let text = if h.is_whole() { text } else { h.excerpt(&text) };
+                (*v, h.color, h.created, text, h.start)
+            })
+            .filter(|(v, _, _, text, _)| {
                 q.is_empty() || v.display().to_lowercase().contains(&q) || text.to_lowercase().contains(&q)
             })
             .collect();
@@ -119,7 +128,7 @@ impl State {
             tabs.push((
                 Some(c),
                 env.settings.highlight_name(c),
-                scoped.iter().filter(|(_, hc, _, _)| *hc == c).count(),
+                scoped.iter().filter(|(_, hc, _, _, _)| *hc == c).count(),
             ));
         }
         for (c, label, n) in tabs {
@@ -143,8 +152,8 @@ impl State {
         let body = y + 28.0 + 20.0;
         let mut bottoms = vec![body; columns];
         let serif = FontId::new(16.0, theme::family(theme::SERIF));
-        for (v, color, created, verse) in
-            scoped.iter().filter(|(_, c, _, _)| self.color.is_none_or(|s| s == *c))
+        for (v, color, created, verse, start) in
+            scoped.iter().filter(|(_, c, _, _, _)| self.color.is_none_or(|s| s == *c))
         {
             let lines = flow(&painter, verse, &serif, 12.0, card_w - 32.0 - 4.0, 3);
             let h = 16.0 + 16.0 + 10.0 + ROW * lines.len().max(1) as f32 + 16.0;
@@ -154,7 +163,7 @@ impl State {
                 vec2(card_w, h),
             );
             bottoms[col] = card.bottom() + GAP_Y;
-            let resp = ui.interact(card, ui.id().with(("highlight", v.key())), Sense::click());
+            let resp = ui.interact(card, ui.id().with(("highlight", v.key(), *start)), Sense::click());
             painter.add(
                 egui::epaint::RectShape::filled(
                     card.translate(vec2(0.0, 1.0)),
@@ -211,7 +220,7 @@ impl State {
             }
             resp.context_menu(|ui| {
                 if ui.button("Remove Highlight").clicked() {
-                    actions.push(Action::RemoveHighlight(*v));
+                    actions.push(Action::RemoveHighlight(*v, *start));
                 }
             });
         }

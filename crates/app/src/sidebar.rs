@@ -15,6 +15,7 @@ use eframe::egui::{
 };
 
 use crate::actions::{Action, ExportKind, SidebarTab};
+use crate::book_filter;
 use crate::theme::{self, Palette, Theme, text};
 use crate::widgets;
 
@@ -517,26 +518,45 @@ impl Sidebar {
         let t = env.library.load(env.translation).ok();
         let verse_text =
             |v: VerseRef| t.as_ref().and_then(|t| t.find(v)).map(|v| v.plain_text()).unwrap_or_default();
-        // (verse, colour bar, note)
-        let items: Vec<(VerseRef, Option<Color32>, Option<String>)> = match kind {
+        /// A row: its verse, colour bar, note and snippet, and which of the verse's highlights.
+        struct Row {
+            verse: VerseRef,
+            bar: Option<Color32>,
+            note: Option<String>,
+            snippet: String,
+            start: u32,
+        }
+        let row = |verse: VerseRef, note: Option<String>| Row {
+            verse,
+            bar: None,
+            note,
+            snippet: verse_text(verse),
+            start: 0,
+        };
+        let items: Vec<Row> = match kind {
             StudyKind::Bookmarks => {
                 let mut b = study.bookmarks();
                 b.sort_by_key(|(v, b)| (std::cmp::Reverse(b.created), *v));
-                b.into_iter().map(|(v, _)| (v, None, None)).collect()
+                b.into_iter().map(|(v, _)| row(v, None)).collect()
             }
             StudyKind::Highlights => {
                 colour_filter(ui, p, &mut self.highlight_filter);
+                // Part of a verse shows the words it covers.
                 study
-                    .highlights_newest_first()
+                    .highlights_dated()
                     .into_iter()
-                    .filter(|(_, c)| self.highlight_filter.is_none_or(|f| f == *c))
-                    .map(|(v, c)| (v, Some(p.swatch(c)), None))
+                    .filter(|(_, h)| self.highlight_filter.is_none_or(|f| f == h.color))
+                    .map(|(v, h)| {
+                        let r = row(v, None);
+                        let snippet = if h.is_whole() { r.snippet } else { h.excerpt(&r.snippet) };
+                        Row { bar: Some(p.swatch(h.color)), snippet, start: h.start, ..r }
+                    })
                     .collect()
             }
             StudyKind::Notes => {
                 let mut n = study.notes();
                 n.sort_by_key(|(v, n)| (std::cmp::Reverse(n.updated), *v));
-                n.into_iter().map(|(v, n)| (v, None, Some(n.body.replace('\n', " ")))).collect()
+                n.into_iter().map(|(v, n)| row(v, Some(n.body.replace('\n', " ")))).collect()
             }
         };
         if items.is_empty() {
@@ -554,7 +574,7 @@ impl Sidebar {
         let k = StudyKind::ALL.iter().position(|x| *x == kind).unwrap_or(0);
         let total = items.len();
         let shown = if self.study_all[k] { total } else { total.min(RECENT_ITEMS) };
-        for (v, bar, note) in items.into_iter().take(shown) {
+        for Row { verse: v, bar, note, snippet, start } in items.into_iter().take(shown) {
             let name = t
                 .as_ref()
                 .map(|t| t.meta.ref_name(v.book).to_string())
@@ -564,7 +584,7 @@ impl Sidebar {
                 trailing: abbrev.clone(),
                 bar,
                 note,
-                snippet: verse_text(v),
+                snippet,
                 selected: env.selection == Some(v),
             };
             let resp = list_item(ui, p, &item);
@@ -574,7 +594,7 @@ impl Sidebar {
             resp.context_menu(|ui| {
                 let (label, a) = match kind {
                     StudyKind::Bookmarks => ("Remove bookmark", Action::RemoveBookmark(v)),
-                    StudyKind::Highlights => ("Remove highlight", Action::RemoveHighlight(v)),
+                    StudyKind::Highlights => ("Remove highlight", Action::RemoveHighlight(v, start)),
                     StudyKind::Notes => ("Delete note", Action::RemoveNote(v)),
                 };
                 if ui.button(label).clicked() {
@@ -783,43 +803,38 @@ impl Sidebar {
                     _ => "All books".into(),
                 };
                 let resp = select_field(ui, p, select, &label, "scope-book");
-                crate::menu::popup(&resp, p).show(|ui| {
-                    ui.set_min_width(200.0);
-                    let testament = match self.scope {
-                        Scope::OldTestament => Some(false),
-                        Scope::NewTestament => Some(true),
-                        _ => None,
-                    };
-                    if ui.selectable_label(!matches!(self.scope, Scope::Book(_)), "All books").clicked() {
+                let testament = match self.scope {
+                    Scope::OldTestament => Some(false),
+                    Scope::NewTestament => Some(true),
+                    _ => None,
+                };
+                let listed: Vec<BookId> = BookId::all()
+                    .filter(|b| testament.is_none_or(|nt| (*b >= FIRST_NT_BOOK) == nt))
+                    .collect();
+                let searchable: Vec<BookId> = BookId::all().collect();
+                let current = match self.scope {
+                    Scope::Book(b) => Some(b),
+                    _ => None,
+                };
+                let books = book_filter::Books {
+                    current,
+                    here: Some(book),
+                    listed: &listed,
+                    searchable: &searchable,
+                    name: &|b: BookId| b.name().to_string(),
+                    width: 200.0,
+                };
+                match book_filter::show(&resp, p, books) {
+                    Some(book_filter::Pick::All) => {
                         self.scope = match testament {
                             Some(false) => Scope::OldTestament,
                             Some(true) => Scope::NewTestament,
                             None => Scope::All,
                         };
-                        ui.close();
                     }
-                    if ui
-                        .selectable_label(
-                            self.scope == Scope::Book(book),
-                            format!("{} (this book)", book.name()),
-                        )
-                        .clicked()
-                    {
-                        self.scope = Scope::Book(book);
-                        ui.close();
-                    }
-                    crate::menu::separator(ui);
-                    ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        for b in
-                            BookId::all().filter(|b| testament.is_none_or(|nt| (*b >= FIRST_NT_BOOK) == nt))
-                        {
-                            if ui.selectable_label(self.scope == Scope::Book(b), b.name()).clicked() {
-                                self.scope = Scope::Book(b);
-                                ui.close();
-                            }
-                        }
-                    });
-                });
+                    Some(book_filter::Pick::Book(b)) => self.scope = Scope::Book(b),
+                    None => {}
+                }
                 let check =
                     Rect::from_min_size(pos2(select.right() + 16.0, row.center().y - 8.0), vec2(16.0, 16.0));
                 if widgets::checkbox(ui, p, check, *whole_words, "Whole words").clicked() {

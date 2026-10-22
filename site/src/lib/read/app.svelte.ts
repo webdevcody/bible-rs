@@ -22,6 +22,7 @@ import {
 	type PlanProgress,
 	type ReadingSession,
 	type StudyItem,
+	type TextSpan,
 	type TranslationInfo,
 	type VerseContent,
 	type VerseMarks,
@@ -82,7 +83,8 @@ export type Action =
 	| { type: 'toggleBookmark' }
 	| { type: 'toggleBookmarkAt'; verse: VerseRef }
 	| { type: 'removeBookmark'; verse: VerseRef }
-	| { type: 'removeHighlight'; verse: VerseRef }
+	/** One highlight of a verse: the one a study item's `start` names. */
+	| { type: 'removeHighlight'; verse: VerseRef; start: number }
 	| { type: 'removeNote'; verse: VerseRef }
 	| { type: 'saveNote'; verse: VerseRef; body: string }
 	| { type: 'startPlan'; id: string }
@@ -154,6 +156,14 @@ const TOAST_MS = 4000;
 const BACKUPS_KEY = 'bible.read.backups';
 const BACKUPS_KEPT = 10;
 
+/** Words chosen in the reader: the stretch, the parallel column, and the translation they were
+ *  counted in (they go when that column shows another). */
+export interface Words {
+	span: TextSpan;
+	column: number;
+	translation: string;
+}
+
 export const refEq = (a: VerseRef, b: VerseRef) =>
 	a.book === b.book && a.chapter === b.chapter && a.verse === b.verse;
 export const refCmp = (a: VerseRef, b: VerseRef) =>
@@ -188,6 +198,14 @@ export class ReadApp {
 	/** The furthest verse in view in the current chapter (reading history). */
 	furthest = $state(0);
 	selection = $state.raw<[VerseRef, VerseRef] | null>(null);
+	/** Words chosen in the reader (a text selection) and their parallel column; the verses they
+	 *  touch are the selection, and they go when it changes to anything else. */
+	words = $state.raw<Words | null>(null);
+	/** The reader was last pressed by touch (or a pen): the highlight bar shows for its selection. */
+	touch = $state(false);
+	/** Chosen words kept while the pointer is pressed outside the text (a menu, the highlight bar),
+	 *  which may take the page's selection away. */
+	heldWords: Words | null = null;
 	history = $state<{ back: Loc[]; forward: Loc[] }>({ back: [], forward: [] });
 	page = $state<Page>('reader');
 	/** The translation selected on the Translations page (an import selects what it added). */
@@ -436,6 +454,37 @@ export class ReadApp {
 		return out;
 	}
 
+	/** The chosen words, while their verses are the selection and their column shows the
+	 *  translation they were counted in. */
+	wordSpan(): Words | null {
+		const w = this.words;
+		const sel = this.selection;
+		if (!w || !sel || this.columns()[w.column] !== w.translation) return null;
+		return refEq(sel[0], w.span.first) && refEq(sel[1], w.span.last) ? w : null;
+	}
+
+	/** Chooses words (`null` lets go of them, and of their verses). */
+	selectWords(words: Words | null) {
+		if (words) {
+			this.words = words;
+			this.selection = [words.span.first, words.span.last];
+		} else if (this.wordSpan()) {
+			this.words = null;
+			this.selection = null;
+		}
+	}
+
+	/** The colour all of the selection has (the chosen words, else the selected verses whole). */
+	selectionColor(): HighlightColor | null {
+		void this.studyGen;
+		const refs = this.selectedRefs();
+		const w = this.wordSpan();
+		const span = w?.span ?? (refs.length ? { first: refs[0], start: 0, last: refs[refs.length - 1], end: 0xffffffff } : null);
+		const id = w?.translation ?? this.settings.translation;
+		if (!span || !this.core?.has(id)) return null;
+		return (this.core.bible.spanColor(id, span) as HighlightColor | undefined) ?? null;
+	}
+
 	hereRef(): VerseRef {
 		return this.refAt(this.here.chapter, this.here.verse);
 	}
@@ -460,11 +509,14 @@ export class ReadApp {
 
 	/** Selects a verse; with `extend`, from the selection's start to it (same chapter only). */
 	select(v: VerseRef, extend: boolean) {
+		// Clicking the verse of chosen words selects it whole, rather than letting go of it.
+		const words = this.wordSpan();
+		this.words = null;
 		const sel = this.selection;
 		if (sel && extend && sel[0].book === v.book && sel[0].chapter === v.chapter) {
 			const a = sel[0];
 			this.selection = refCmp(v, a) < 0 ? [v, a] : [a, v];
-		} else if (sel && !extend && refEq(sel[0], v) && refEq(sel[1], v)) {
+		} else if (sel && !extend && !words && refEq(sel[0], v) && refEq(sel[1], v)) {
 			this.selection = null;
 		} else {
 			this.selection = [v, v];
@@ -472,6 +524,7 @@ export class ReadApp {
 	}
 
 	setSelection(v: VerseRef | null) {
+		this.words = null;
 		this.selection = v ? [v, v] : null;
 	}
 
@@ -501,7 +554,7 @@ export class ReadApp {
 			}
 		}
 		if (target) {
-			this.selection = [target, target];
+			this.setSelection(target);
 			this.reader?.ensureVisible(target);
 		}
 	}
@@ -527,6 +580,8 @@ export class ReadApp {
 
 	marks(id: string, index: number): Map<number, VerseMarks> {
 		void this.studyGen;
+		// Highlights are placed in the translation's text: again once it has loaded.
+		void this.loaded.has(id);
 		const out = new Map<number, VerseMarks>();
 		if (!this.core) return out;
 		for (const m of this.core.bible.marks(id, index) as VerseMarks[]) out.set(m.verse, m);
@@ -833,6 +888,12 @@ export class ReadApp {
 				s.parallel = s.parallel.filter((p) => p !== a.id);
 				break;
 			case 'highlight': {
+				// Chosen words: just those, placed in the text they were chosen in.
+				const w = this.wordSpan();
+				if (w) {
+					this.study((c) => c.bible.highlightSpan(w.translation, w.span, a.color), "Couldn't save highlight");
+					break;
+				}
 				const refs = this.selectedRefs();
 				if (refs.length)
 					this.study((c) => refs.forEach((r) => c.bible.setHighlight(r, a.color)), "Couldn't save highlight");
@@ -858,7 +919,7 @@ export class ReadApp {
 				this.study((c) => c.bible.setBookmark(a.verse, null));
 				break;
 			case 'removeHighlight':
-				this.study((c) => c.bible.setHighlight(a.verse, null));
+				this.study((c) => c.bible.removeHighlight(a.verse, a.start));
 				break;
 			case 'removeNote':
 				this.study((c) => c.bible.setNote(a.verse, ''));
@@ -912,12 +973,24 @@ export class ReadApp {
 				this.#dropReading(a.since);
 				break;
 			case 'copyText': {
+				const w = this.wordSpan();
+				if (w) {
+					const text = this.core?.copySpan(w.translation, w.span, 'plain');
+					if (text) void this.#copy(text, 'Copied');
+					break;
+				}
 				const refs = this.selectedRefs();
 				const text = this.core?.copyText(s.translation, refs, 'plain');
 				if (refs.length && text) void this.#copy(text, 'Copied');
 				break;
 			}
 			case 'copy': {
+				const w = this.wordSpan();
+				if (w) {
+					const text = this.core?.copySpan(w.translation, w.span, 'reference');
+					if (text) void this.#copy(text, 'Copied with reference');
+					break;
+				}
 				const refs = this.selectedRefs();
 				const text = this.core?.copyText(s.translation, refs, 'reference');
 				if (refs.length && text) void this.#copy(text, 'Copied with reference');

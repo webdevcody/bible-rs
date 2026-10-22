@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bible_core::books::{BookId, ChapterIdx, FIRST_NT_BOOK, VerseRef};
 use bible_core::library::Library;
+use bible_core::reference::Reference;
 use bible_core::search::{Query, Scope};
 use bible_core::study::{HighlightColor, StudyStore};
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -103,6 +104,12 @@ pub struct Sidebar {
     activity: (u64, HashSet<ChapterIdx>),
     /// For a search that found nothing: a spelling that finds verses (query, count, first verse).
     suggestion: Option<(String, usize, u32)>,
+    /// A query that names a passage ("gen 1:14", or "1:14" in the book being read) and the verse
+    /// it opens at, listed above the hits; the query and translation it was read for; and
+    /// whether it is the selected row.
+    reference: Option<(Reference, u32)>,
+    reference_key: Option<(String, String)>,
+    on_reference: bool,
 }
 
 impl Sidebar {
@@ -135,6 +142,9 @@ impl Sidebar {
             revealed: None,
             activity: (0, HashSet::new()),
             suggestion: None,
+            reference: None,
+            reference_key: None,
+            on_reference: false,
         }
     }
 
@@ -194,6 +204,7 @@ impl Sidebar {
 
     pub fn invalidate_search(&mut self) {
         self.key = None;
+        self.reference_key = None;
     }
 
     pub fn query(&self) -> &str {
@@ -517,26 +528,45 @@ impl Sidebar {
         let t = env.library.load(env.translation).ok();
         let verse_text =
             |v: VerseRef| t.as_ref().and_then(|t| t.find(v)).map(|v| v.plain_text()).unwrap_or_default();
-        // (verse, colour bar, note)
-        let items: Vec<(VerseRef, Option<Color32>, Option<String>)> = match kind {
+        /// A row: its verse, colour bar, note and snippet, and which of the verse's highlights.
+        struct Row {
+            verse: VerseRef,
+            bar: Option<Color32>,
+            note: Option<String>,
+            snippet: String,
+            start: u32,
+        }
+        let row = |verse: VerseRef, note: Option<String>| Row {
+            verse,
+            bar: None,
+            note,
+            snippet: verse_text(verse),
+            start: 0,
+        };
+        let items: Vec<Row> = match kind {
             StudyKind::Bookmarks => {
                 let mut b = study.bookmarks();
                 b.sort_by_key(|(v, b)| (std::cmp::Reverse(b.created), *v));
-                b.into_iter().map(|(v, _)| (v, None, None)).collect()
+                b.into_iter().map(|(v, _)| row(v, None)).collect()
             }
             StudyKind::Highlights => {
                 colour_filter(ui, p, &mut self.highlight_filter);
+                // Part of a verse shows the words it covers.
                 study
-                    .highlights_newest_first()
+                    .highlights_dated()
                     .into_iter()
-                    .filter(|(_, c)| self.highlight_filter.is_none_or(|f| f == *c))
-                    .map(|(v, c)| (v, Some(p.swatch(c)), None))
+                    .filter(|(_, h)| self.highlight_filter.is_none_or(|f| f == h.color))
+                    .map(|(v, h)| {
+                        let r = row(v, None);
+                        let snippet = if h.is_whole() { r.snippet } else { h.excerpt(&r.snippet) };
+                        Row { bar: Some(p.swatch(h.color)), snippet, start: h.start, ..r }
+                    })
                     .collect()
             }
             StudyKind::Notes => {
                 let mut n = study.notes();
                 n.sort_by_key(|(v, n)| (std::cmp::Reverse(n.updated), *v));
-                n.into_iter().map(|(v, n)| (v, None, Some(n.body.replace('\n', " ")))).collect()
+                n.into_iter().map(|(v, n)| row(v, Some(n.body.replace('\n', " ")))).collect()
             }
         };
         if items.is_empty() {
@@ -554,7 +584,7 @@ impl Sidebar {
         let k = StudyKind::ALL.iter().position(|x| *x == kind).unwrap_or(0);
         let total = items.len();
         let shown = if self.study_all[k] { total } else { total.min(RECENT_ITEMS) };
-        for (v, bar, note) in items.into_iter().take(shown) {
+        for Row { verse: v, bar, note, snippet, start } in items.into_iter().take(shown) {
             let name = t
                 .as_ref()
                 .map(|t| t.meta.ref_name(v.book).to_string())
@@ -564,7 +594,7 @@ impl Sidebar {
                 trailing: abbrev.clone(),
                 bar,
                 note,
-                snippet: verse_text(v),
+                snippet,
                 selected: env.selection == Some(v),
             };
             let resp = list_item(ui, p, &item);
@@ -574,7 +604,7 @@ impl Sidebar {
             resp.context_menu(|ui| {
                 let (label, a) = match kind {
                     StudyKind::Bookmarks => ("Remove bookmark", Action::RemoveBookmark(v)),
-                    StudyKind::Highlights => ("Remove highlight", Action::RemoveHighlight(v)),
+                    StudyKind::Highlights => ("Remove highlight", Action::RemoveHighlight(v, start)),
                     StudyKind::Notes => ("Delete note", Action::RemoveNote(v)),
                 };
                 if ui.button(label).clicked() {
@@ -715,6 +745,54 @@ impl Sidebar {
         });
     }
 
+    /// Reads the query as a passage when it names one. A bare "1:14" means the book being read
+    /// when the query was typed, so going to a hit in another book doesn't move it there.
+    fn update_reference(&mut self, t: &bible_core::Translation, translation: &str, book: BookId) {
+        let key = (self.query.clone(), translation.to_string());
+        if self.reference_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.reference = bible_core::reference::parse_query(&self.query, book)
+            .and_then(|r| r.target(t).map(|v| (r, v.index)));
+        // It is the first row, so return goes there.
+        self.on_reference = self.reference.is_some();
+        self.reference_key = Some(key);
+    }
+
+    /// The verse return goes to: the passage the query names, or the selected hit.
+    fn selected_verse(&self) -> Option<u32> {
+        if self.on_reference {
+            self.reference.map(|(_, vi)| vi)
+        } else {
+            self.results.get(self.selected).copied()
+        }
+    }
+
+    /// The passage the query names, as the top result: its reference and its text. True when
+    /// clicked.
+    fn reference_row(&mut self, ui: &mut Ui, p: &Palette, t: &bible_core::Translation) -> bool {
+        let Some((r, vi)) = self.reference else { return false };
+        if t.verse_view(vi).is_none() {
+            return false;
+        }
+        let item = ListItem {
+            reference: r.display_in(t),
+            trailing: t.meta.abbrev.clone(),
+            bar: None,
+            note: None,
+            snippet: r.text_in(t),
+            selected: self.on_reference,
+        };
+        let clicked = egui::Frame::NONE
+            .inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 4 })
+            .show(ui, |ui| list_item(ui, p, &item).clicked())
+            .inner;
+        if clicked {
+            self.on_reference = true;
+        }
+        clicked
+    }
+
     /// Search results (frame 06 in the design): scope, book and whole-word filters, a count, then
     /// the hits grouped by book with the matched phrase marked.
     #[allow(clippy::too_many_arguments)]
@@ -735,6 +813,7 @@ impl Sidebar {
             );
             return;
         };
+        self.update_reference(&t, translation, location.0.book());
         let mut jump_to: Option<u32> = None;
         // The query lives in the toolbar's field; arrow keys and return drive the results, and the
         // reader's result navigator steps through them.
@@ -748,15 +827,20 @@ impl Sidebar {
                     step -= 1;
                 }
                 if i.key_pressed(Key::Enter) {
-                    jump_to = self.results.get(self.selected).copied();
+                    jump_to = self.selected_verse();
                 }
             });
         }
-        if step != 0 && !self.results.is_empty() {
-            self.selected =
-                (self.selected as i64 + step as i64).clamp(0, self.results.len() as i64 - 1) as usize;
-            self.scroll_to_selected = true;
-            jump_to = self.results.get(self.selected).copied();
+        if step != 0 && (!self.results.is_empty() || self.reference.is_some()) {
+            // The passage the query names is the row above the first hit.
+            let above = usize::from(self.reference.is_some());
+            let at = if self.on_reference { 0 } else { self.selected + above };
+            let last = self.results.len() + above - 1;
+            let to = (at as i64 + step as i64).clamp(0, last as i64) as usize;
+            self.on_reference = above == 1 && to == 0;
+            self.selected = to.saturating_sub(above);
+            self.scroll_to_selected = !self.on_reference;
+            jump_to = self.selected_verse();
         }
 
         let book = location.0.book();
@@ -853,7 +937,7 @@ impl Sidebar {
                     ui.painter().text(
                         pos2(row.left() + 4.0, row.top() + 4.0 + 8.0),
                         Align2::LEFT_CENTER,
-                        "No verses match",
+                        if self.reference.is_some() { "No verse text matches" } else { "No verses match" },
                         theme::ui_medium(text::SMALL.size),
                         p.ink_2,
                     );
@@ -907,8 +991,18 @@ impl Sidebar {
             },
         );
 
+        if self.reference.is_some() && self.reference_row(ui, p, &t) {
+            jump_to = self.reference.map(|(_, vi)| vi);
+        }
         if self.results.is_empty() {
-            self.no_results(ui, p, &t, whole_words);
+            if self.reference.is_none() {
+                self.no_results(ui, p, &t, whole_words);
+            }
+            if let Some(vi) = jump_to
+                && let Some(v) = t.verse_view(vi)
+            {
+                actions.push(Action::Jump { chapter: v.chapter, verse: Some(v.number), flash: true });
+            }
             return;
         }
         let query = Query::parse(&self.query, *whole_words);
@@ -959,7 +1053,7 @@ impl Sidebar {
                         let vi = self.results[i];
                         let Some(v) = t.verse_view(vi) else { continue };
                         let resp = ui.interact(r, ui.id().with(("hit", vi)), Sense::click());
-                        let selected = i == self.selected;
+                        let selected = i == self.selected && !self.on_reference;
                         if selected {
                             ui.painter().rect_filled(r, 10.0, p.accent_soft);
                         } else if let Some(fill) = widgets::hover_fill(ui, &resp, p, false) {
@@ -992,6 +1086,7 @@ impl Sidebar {
                         paint_snippet(ui.painter(), p, pos2(inner.left(), inner.top() + 20.0), job, &hits);
                         if resp.clicked() {
                             self.selected = i;
+                            self.on_reference = false;
                             jump_to = Some(vi);
                         }
                     }

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bible_core::books::{BookId, ChapterIdx, VerseRef};
-use bible_core::library::Library;
-use bible_core::study::StudyStore;
+use bible_core::library::{Chapter, Library};
+use bible_core::study::{HighlightColor, StudyStore, TextSpan};
 use eframe::egui::{self, Align2, Frame, Id, Key, Modifiers, Sense, Stroke, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
@@ -556,6 +556,27 @@ impl BibleApp {
         }
     }
 
+    /// Translation `id`'s text of chapter `c`: where chosen words are counted.
+    fn chapter_text(&self, id: &str, c: ChapterIdx) -> Option<Arc<bible_core::Translation>> {
+        match self.library.chapter(id, c) {
+            Chapter::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The colour all of the selection has (the chosen words, else the selected verses whole).
+    fn selection_color(&self) -> Option<HighlightColor> {
+        let (span, id) = match self.reader.text_span() {
+            Some((span, id)) => (span, id.to_string()),
+            None => {
+                let refs = self.reader.selected_refs();
+                (TextSpan::verses(*refs.first()?, *refs.last()?), self.settings.translation.clone())
+            }
+        };
+        let t = self.chapter_text(&id, span.first.chapter_idx());
+        self.study.span_color(&span, |r| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string()))
+    }
+
     fn selection_or_location(&self) -> Vec<VerseRef> {
         let sel = self.reader.selected_refs();
         if sel.is_empty() {
@@ -662,6 +683,15 @@ impl BibleApp {
                 self.settings.parallel.retain(|p| *p != id);
             }
             Action::Highlight(color) => {
+                // Chosen words: just those, placed in the text they were chosen in.
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    let text = |r: VerseRef| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string());
+                    if let Err(e) = self.study.highlight_span(&span, color, text) {
+                        self.toast(ctx, format!("Couldn't save highlight: {e:#}"));
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -694,8 +724,8 @@ impl BibleApp {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
-            Action::RemoveHighlight(v) => {
-                if let Err(e) = self.study.set_highlight(v, None) {
+            Action::RemoveHighlight(v, start) => {
+                if let Err(e) = self.study.remove_highlight(v, start) {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
@@ -708,6 +738,14 @@ impl BibleApp {
                 }
             }
             Action::CopyText => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::span_text(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if let Ok(t) = self.library.load(&self.settings.translation) {
                     let text: Vec<String> =
@@ -730,6 +768,14 @@ impl BibleApp {
                 }
             }
             Action::Copy => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::format_span(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied with reference");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -2438,9 +2484,10 @@ impl eframe::App for BibleApp {
                 }
             }
         }
+        let current = self.verse_menu.as_ref().and_then(|_| self.selection_color());
         if let Some(menu) = &mut self.verse_menu {
             let refs = self.reader.selected_refs();
-            if menu.show(&ctx, p, &self.study, &refs, &self.settings, &mut actions) {
+            if menu.show(&ctx, p, &self.study, &refs, current, &self.settings, &mut actions) {
                 self.verse_menu = None;
             }
         }

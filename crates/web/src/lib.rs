@@ -11,9 +11,10 @@ use std::ops::Range;
 
 use bible_core::books::{BOOKS, CHAPTER_COUNT, FIRST_NT_BOOK};
 use bible_core::content::{self, ContentOptions};
+use bible_core::highlight::{chars_from_utf16, utf16_from_chars};
 use bible_core::model::{Translation, TranslationMeta};
 use bible_core::search::{Query, Scope};
-use bible_core::study::{HighlightColor, Include, ReadingSession, StudyStore};
+use bible_core::study::{HighlightColor, Include, ReadingSession, StudyStore, TextSpan};
 use bible_core::{BookId, ChapterIdx, VerseRef, bundled, format, plans};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -161,9 +162,32 @@ struct SearchSuggestion {
 #[serde(rename_all = "camelCase")]
 struct VerseMarks {
     verse: u8,
+    /// The verse's highlight colour (the newest, when parts of it differ).
     highlight: Option<HighlightColor>,
+    /// What's highlighted of the verse's text, in order: whole verses and parts of them.
+    highlights: Vec<HighlightRange>,
     note: bool,
     bookmark: bool,
+}
+
+/// A highlighted stretch of a verse, `[start, end)` in UTF-16 units of its text (as runs'
+/// `offset` counts).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HighlightRange {
+    start: u32,
+    end: u32,
+    color: HighlightColor,
+}
+
+/// A stretch of text in one chapter: from `start` in verse `first` to before `end` in verse
+/// `last`, UTF-16 offsets into the verse texts (an `end` past a verse's text runs to its end).
+#[derive(Deserialize)]
+struct Span {
+    first: Verse,
+    start: u32,
+    last: Verse,
+    end: u32,
 }
 
 #[derive(Serialize)]
@@ -183,6 +207,8 @@ struct StudyItem {
     /// The verse in the translation asked for (empty if it hasn't the verse or isn't loaded).
     text: String,
     highlight: Option<HighlightColor>,
+    /// A highlight's place in its verse, for `removeHighlight` (0 for a whole verse).
+    start: u32,
     /// A note's text, or a bookmark's label.
     body: String,
     /// Unix seconds.
@@ -415,6 +441,29 @@ impl Bible {
         to_js(&SearchPage { total: verses.len() as u32, books, hits, suggestion })
     }
 
+    /// The passage a search query names ("genesis 1:14", "gen 1:14", "ps 23", or a bare "1:14"
+    /// in `current_book`), as a hit to list above the others, or null when the query isn't a
+    /// reference or the translation hasn't the verse.
+    #[wasm_bindgen(js_name = searchReference)]
+    pub fn search_reference(
+        &self,
+        translation: &str,
+        query: &str,
+        current_book: u8,
+    ) -> Result<JsValue, JsError> {
+        let t = self.get(translation)?;
+        let Some(book) = BookId::new(current_book as usize) else { return Ok(JsValue::NULL) };
+        let Some(r) = bible_core::reference::parse_query(query, book) else { return Ok(JsValue::NULL) };
+        let Some(v) = r.target(t) else { return Ok(JsValue::NULL) };
+        to_js(&SearchHit {
+            verse: v.reference().into(),
+            chapter_index: v.chapter.0,
+            reference: r.display_in(t),
+            text: r.text_in(t),
+            matches: Vec::new(),
+        })
+    }
+
     /// Verses as text for the clipboard or a share sheet. `format` is "plain" (the verses
     /// joined), "reference" (`“text” — John 3:16 (KJV)`, or a reference line and numbered verses
     /// for several) or "markdown" (a quote with its reference). Null when none of the verses are
@@ -449,21 +498,54 @@ impl Bible {
         }))
     }
 
+    /// Words chosen in `translation` for the clipboard: "plain" (just the words) or "reference"
+    /// (`“so loved the world” — John 3:16 (KJV)`). Null when the translation hasn't them.
+    #[wasm_bindgen(js_name = copySpan)]
+    pub fn copy_span(
+        &self,
+        translation: &str,
+        span: JsValue,
+        format: &str,
+    ) -> Result<Option<String>, JsError> {
+        let t = self.get(translation)?;
+        let span = text_span(t, span)?;
+        Ok(match format {
+            "plain" => bible_core::copy::span_text(t, &span),
+            _ => bible_core::copy::format_span(t, &span),
+        })
+    }
+
     /// Highlights, notes and bookmarks on the verses of a chapter (as numbered in `translation`,
     /// or the KJV's numbering when it isn't loaded).
     pub fn marks(&self, translation: &str, index: u16) -> Result<JsValue, JsError> {
         let c = chapter_idx(index);
-        let numbers: Vec<u8> = match self.translations.get(translation) {
-            Some(t) if t.has_chapter(c) => t.verses_in(c).map(|v| v.number).collect(),
-            _ => (1..=c.kjv_verses()).collect(),
+        let t = self.translations.get(translation).filter(|t| t.has_chapter(c));
+        let numbers: Vec<u8> = match t {
+            Some(t) => t.verses_in(c).map(|v| v.number).collect(),
+            None => (1..=c.kjv_verses()).collect(),
         };
         let marks: Vec<VerseMarks> = numbers
             .into_iter()
             .filter_map(|n| {
                 let r = VerseRef::new(c.book(), c.chapter(), n);
+                let highlights = match t.and_then(|t| t.find(r)).filter(|_| self.study.highlight(r).is_some())
+                {
+                    Some(v) => self
+                        .study
+                        .highlight_ranges(r, v.text)
+                        .into_iter()
+                        .map(|(range, color)| HighlightRange {
+                            start: utf16_from_chars(v.text, range.start) as u32,
+                            end: utf16_from_chars(v.text, range.end) as u32,
+                            color,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
                 let marks = VerseMarks {
                     verse: n,
                     highlight: self.study.highlight(r),
+                    highlights,
                     note: self.study.note(r).is_some(),
                     bookmark: self.study.is_bookmarked(r),
                 };
@@ -482,16 +564,43 @@ impl Bible {
     /// "purple" or "orange".
     #[wasm_bindgen(js_name = setHighlight)]
     pub fn set_highlight(&mut self, verse: JsValue, color: Option<String>) -> Result<(), JsError> {
-        let color = match color {
-            Some(c) => Some(
-                HighlightColor::ALL
-                    .into_iter()
-                    .find(|h| h.name() == c)
-                    .ok_or_else(|| JsError::new(&format!("no highlight colour {c}")))?,
-            ),
-            None => None,
-        };
+        let color = color_arg(color)?;
         self.study.set_highlight(verse_arg(verse)?, color).map_err(err)
+    }
+
+    /// Colours a stretch of text as read in `translation` (`{first, start, last, end}`, UTF-16
+    /// offsets into the verse texts), or with null clears it: over the highlights there, which it
+    /// replaces where they overlap.
+    #[wasm_bindgen(js_name = highlightSpan)]
+    pub fn highlight_span(
+        &mut self,
+        translation: &str,
+        span: JsValue,
+        color: Option<String>,
+    ) -> Result<(), JsError> {
+        let color = color_arg(color)?;
+        let Bible { translations, study } = self;
+        let t = translations
+            .get(translation)
+            .ok_or_else(|| JsError::new(&format!("{translation} isn't loaded")))?;
+        let span = text_span(t, span)?;
+        let text = |r: VerseRef| t.find(r).map(|v| v.text.to_string());
+        study.highlight_span(&span, color, text).map_err(err)
+    }
+
+    /// The colour every letter of a stretch of text has, if one does.
+    #[wasm_bindgen(js_name = spanColor)]
+    pub fn span_color(&self, translation: &str, span: JsValue) -> Result<Option<String>, JsError> {
+        let t = self.get(translation)?;
+        let span = text_span(t, span)?;
+        let text = |r: VerseRef| t.find(r).map(|v| v.text.to_string());
+        Ok(self.study.span_color(&span, text).map(|c| c.name().to_string()))
+    }
+
+    /// Removes one highlight of a verse: the one a study item's `start` names.
+    #[wasm_bindgen(js_name = removeHighlight)]
+    pub fn remove_highlight(&mut self, verse: JsValue, start: u32) -> Result<(), JsError> {
+        self.study.remove_highlight(verse_arg(verse)?, start).map_err(err)
     }
 
     pub fn note(&self, verse: JsValue) -> Result<JsValue, JsError> {
@@ -531,6 +640,7 @@ impl Bible {
             reference: r.to_string(),
             text: t.and_then(|t| t.find(r)).map(|v| v.plain_text()).unwrap_or_default(),
             highlight,
+            start: 0,
             body: body.to_string(),
             created,
             updated,
@@ -541,9 +651,19 @@ impl Bible {
                 .into_iter()
                 .map(|(r, b)| item(r, None, &b.label, b.created, b.created))
                 .collect(),
-            "highlights" => {
-                study.highlights_dated().into_iter().map(|(r, c, at)| item(r, Some(c), "", at, at)).collect()
-            }
+            // Part of a verse shows the words it covers.
+            "highlights" => study
+                .highlights_dated()
+                .into_iter()
+                .map(|(r, h)| {
+                    let mut it = item(r, Some(h.color), "", h.created, h.created);
+                    if !h.is_whole() {
+                        it.text = h.excerpt(&it.text);
+                    }
+                    it.start = h.start;
+                    it
+                })
+                .collect(),
             "notes" => study
                 .notes()
                 .into_iter()
@@ -810,6 +930,28 @@ fn chapter_idx(index: u16) -> ChapterIdx {
 
 fn verse_arg(v: JsValue) -> Result<VerseRef, JsError> {
     serde_wasm_bindgen::from_value::<Verse>(v)?.core()
+}
+
+fn color_arg(color: Option<String>) -> Result<Option<HighlightColor>, JsError> {
+    color
+        .map(|c| {
+            HighlightColor::ALL
+                .into_iter()
+                .find(|h| h.name() == c)
+                .ok_or_else(|| JsError::new(&format!("no highlight colour {c}")))
+        })
+        .transpose()
+}
+
+/// A span from the page, its UTF-16 offsets turned into chars of `t`'s verse texts.
+fn text_span(t: &Translation, span: JsValue) -> Result<TextSpan, JsError> {
+    let s: Span = serde_wasm_bindgen::from_value(span)?;
+    let (first, last) = (s.first.core()?, s.last.core()?);
+    let chars = |r: VerseRef, at: u32| match t.find(r) {
+        Some(v) => chars_from_utf16(v.text, at as usize),
+        None => at as usize,
+    };
+    Ok(TextSpan { first, start: chars(first, s.start), last, end: chars(last, s.end) })
 }
 
 fn verses_arg(v: JsValue) -> Result<Vec<VerseRef>, JsError> {

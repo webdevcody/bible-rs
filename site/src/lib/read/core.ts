@@ -87,6 +87,10 @@ export interface Run {
 	bold: boolean;
 	/** Already upper case; set smaller. */
 	smallCaps: boolean;
+	/** Where the run's text starts in its verse's text (UTF-16), to place highlights and selections. */
+	offset: number;
+	/** A space the layout adds: not in the verse's text, `offset` is where it falls. */
+	added: boolean;
 }
 
 export interface Block {
@@ -136,9 +140,27 @@ export type SearchScope = 'all' | 'ot' | 'nt' | number;
 
 export interface VerseMarks {
 	verse: number;
+	/** The verse's highlight colour (the newest, when parts of it differ). */
 	highlight: HighlightColor | null;
+	/** What's highlighted of the verse's text, in order. */
+	highlights: HighlightRange[];
 	note: boolean;
 	bookmark: boolean;
+}
+
+/** A highlighted stretch of a verse: `[start, end)` in UTF-16 units of its text, as runs' `offset`. */
+export interface HighlightRange {
+	start: number;
+	end: number;
+	color: HighlightColor;
+}
+
+/** Words chosen in a chapter: from `start` in verse `first` to before `end` in verse `last` (UTF-16 offsets into the verse texts). */
+export interface TextSpan {
+	first: VerseRef;
+	start: number;
+	last: VerseRef;
+	end: number;
 }
 
 export interface Note {
@@ -153,6 +175,8 @@ export interface StudyItem {
 	reference: string;
 	text: string;
 	highlight: HighlightColor | null;
+	/** A highlight's place in its verse, for `removeHighlight`. */
+	start: number;
 	body: string;
 	created: number;
 	updated: number;
@@ -268,8 +292,18 @@ export class Core {
 		return this.bible.search(id, query, String(scope), wholeWords, firstBook ?? -1, offset, limit);
 	}
 
+	/** The passage a search query names ("gen 1:14", or "1:14" in `currentBook`), or null. */
+	searchReference(id: string, query: string, currentBook: number): SearchHit | null {
+		return this.has(id) ? (this.bible.searchReference(id, query, currentBook) ?? null) : null;
+	}
+
 	copyText(id: string, verses: VerseRef[], format: CopyFormat): string | null {
 		return this.has(id) ? (this.bible.copyText(id, verses, format) ?? null) : null;
+	}
+
+	/** Chosen words for the clipboard, alone or with their reference. */
+	copySpan(id: string, span: TextSpan, format: 'plain' | 'reference'): string | null {
+		return this.has(id) ? (this.bible.copySpan(id, span, format) ?? null) : null;
 	}
 }
 

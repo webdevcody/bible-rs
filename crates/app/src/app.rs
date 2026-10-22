@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bible_core::books::{BookId, ChapterIdx, VerseRef};
-use bible_core::library::Library;
-use bible_core::study::StudyStore;
+use bible_core::library::{Chapter, Library};
+use bible_core::study::{HighlightColor, StudyStore, TextSpan};
 use eframe::egui::{self, Align2, Frame, Id, Key, Modifiers, Sense, Stroke, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
@@ -556,6 +556,27 @@ impl BibleApp {
         }
     }
 
+    /// Translation `id`'s text of chapter `c`: where chosen words are counted.
+    fn chapter_text(&self, id: &str, c: ChapterIdx) -> Option<Arc<bible_core::Translation>> {
+        match self.library.chapter(id, c) {
+            Chapter::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The colour all of the selection has (the chosen words, else the selected verses whole).
+    fn selection_color(&self) -> Option<HighlightColor> {
+        let (span, id) = match self.reader.text_span() {
+            Some((span, id)) => (span, id.to_string()),
+            None => {
+                let refs = self.reader.selected_refs();
+                (TextSpan::verses(*refs.first()?, *refs.last()?), self.settings.translation.clone())
+            }
+        };
+        let t = self.chapter_text(&id, span.first.chapter_idx());
+        self.study.span_color(&span, |r| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string()))
+    }
+
     fn selection_or_location(&self) -> Vec<VerseRef> {
         let sel = self.reader.selected_refs();
         if sel.is_empty() {
@@ -662,6 +683,15 @@ impl BibleApp {
                 self.settings.parallel.retain(|p| *p != id);
             }
             Action::Highlight(color) => {
+                // Chosen words: just those, placed in the text they were chosen in.
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    let text = |r: VerseRef| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string());
+                    if let Err(e) = self.study.highlight_span(&span, color, text) {
+                        self.toast(ctx, format!("Couldn't save highlight: {e:#}"));
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -694,8 +724,8 @@ impl BibleApp {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
-            Action::RemoveHighlight(v) => {
-                if let Err(e) = self.study.set_highlight(v, None) {
+            Action::RemoveHighlight(v, start) => {
+                if let Err(e) = self.study.remove_highlight(v, start) {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
@@ -708,6 +738,14 @@ impl BibleApp {
                 }
             }
             Action::CopyText => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::span_text(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if let Ok(t) = self.library.load(&self.settings.translation) {
                     let text: Vec<String> =
@@ -730,6 +768,14 @@ impl BibleApp {
                 }
             }
             Action::Copy => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::format_span(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied with reference");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -1333,12 +1379,21 @@ impl BibleApp {
                         on: false,
                         icon: crate::icons::text_size,
                     },
+                    CapsuleButton {
+                        tooltip: "Keyboard shortcuts (?)",
+                        enabled: true,
+                        on: false,
+                        icon: crate::icons::keyboard,
+                    },
                 ];
-                let tools_left = search.left() - GROUP_GAP - 2.0 * BUTTON_WIDTH;
+                let tools_left = search.left() - GROUP_GAP - tools.len() as f32 * BUTTON_WIDTH;
                 let (tools_rect, resp) =
                     widgets::button_capsule(ui, p, tools_left, cy, BUTTON_WIDTH, false, &tools);
                 if resp[0].clicked() {
                     actions.push(Action::ToggleParallel);
+                }
+                if resp[2].clicked() {
+                    actions.push(Action::ShowShortcuts);
                 }
                 text_anchor = Some((resp[1].clone(), true));
                 items.push(tools_rect);
@@ -1678,7 +1733,7 @@ impl BibleApp {
     }
 
     /// The compact toolbar's More menu (frame 34): the view tools, the sidebar and focus mode,
-    /// with their shortcuts as currently bound.
+    /// with their shortcuts as currently bound, and the keyboard shortcuts.
     fn more_menu(&mut self, ui: &mut Ui, more: &egui::Response, actions: &mut Vec<Action>) {
         let p = self.settings.theme.palette();
         let chord = |id: &str| {
@@ -1689,12 +1744,14 @@ impl BibleApp {
                 .unwrap_or_default()
         };
         let sidebar = if self.settings.sidebar_open { "Hide Sidebar" } else { "Show Sidebar" };
-        let items: [Option<(widgets::IconFn, &str, String, Action)>; 5] = [
+        let items: [Option<(widgets::IconFn, &str, String, Action)>; 7] = [
             Some((crate::icons::columns, "Parallel Translations", chord("parallel"), Action::ToggleParallel)),
             Some((crate::icons::text_size, "Text & Layout", "⌘T".into(), Action::TextFormat)),
             None,
             Some((crate::icons::sidebar, sidebar, chord("sidebar"), Action::ToggleSidebar)),
             Some((crate::icons::expand, "Focus Mode", chord("focus"), Action::ToggleFocus)),
+            None,
+            Some((crate::icons::keyboard, "Keyboard Shortcuts", "?".into(), Action::ShowShortcuts)),
         ];
         let id = Id::new(MORE_POPUP);
         if std::mem::take(&mut self.open_more) {
@@ -2438,9 +2495,10 @@ impl eframe::App for BibleApp {
                 }
             }
         }
+        let current = self.verse_menu.as_ref().and_then(|_| self.selection_color());
         if let Some(menu) = &mut self.verse_menu {
             let refs = self.reader.selected_refs();
-            if menu.show(&ctx, p, &self.study, &refs, &self.settings, &mut actions) {
+            if menu.show(&ctx, p, &self.study, &refs, current, &self.settings, &mut actions) {
                 self.verse_menu = None;
             }
         }

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bible_core::books::{BookId, ChapterIdx, VerseRef};
-use bible_core::library::Library;
-use bible_core::study::StudyStore;
+use bible_core::library::{Chapter, Library};
+use bible_core::study::{HighlightColor, StudyStore, TextSpan};
 use eframe::egui::{self, Align2, Frame, Id, Key, Modifiers, Sense, Stroke, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,8 @@ pub struct Settings {
     pub share: crate::share_sheet::ShareOptions,
     /// Remind about the day's plan reading at 7:00 while the app is open.
     pub plan_reminder: bool,
+    /// The highlight colour chosen last, which a new note gives its verse.
+    pub last_highlight: Option<bible_core::study::HighlightColor>,
     /// The first-launch screens are done. Settings saved before they existed count as done.
     #[serde(default = "yes")]
     pub onboarded: bool,
@@ -84,6 +86,7 @@ impl Default for Settings {
             verse: 1,
             whole_words: false,
             plan_reminder: false,
+            last_highlight: None,
             accent: theme::Accent::Ink,
             toolbar_translation: true,
             sidebar_attached: false,
@@ -463,6 +466,12 @@ impl BibleApp {
         // The rows of Settings › Shortcuts, with any chords chosen there.
         let bindings = crate::keymap::bindings(&self.settings.shortcuts);
         let anywhere = |a: &Action| matches!(a, Action::OpenPalette | Action::OpenSearch(_));
+        let note_open = self.note_popover.is_some();
+        // Return on a selected verse that has a note opens it; otherwise return is left alone.
+        let noted = match self.reader.selected_refs().as_slice() {
+            [v] if self.study.note(*v).is_some() => Some(*v),
+            _ => None,
+        };
         ctx.input_mut(|i| {
             let cmd = Modifiers::COMMAND;
             let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -536,7 +545,14 @@ impl BibleApp {
             key(Modifiers::NONE, Key::Space, Action::ScrollPages(1.0));
             key(Modifiers::NONE, Key::J, Action::SelectNext);
             key(Modifiers::NONE, Key::K, Action::SelectPrev);
-            key(Modifiers::NONE, Key::Escape, Action::ClearSelection);
+            // With a note open, escape is the note's (egui has already taken the keyboard from
+            // its editor by now, so `typing` doesn't cover it).
+            if !note_open {
+                key(Modifiers::NONE, Key::Escape, Action::ClearSelection);
+            }
+            if let Some(v) = noted {
+                key(Modifiers::NONE, Key::Enter, Action::EditNote(v));
+            }
             key(Modifiers::NONE, Key::Slash, Action::OpenSearch(None));
             key(Modifiers::SHIFT, Key::Questionmark, Action::ShowShortcuts);
             key(Modifiers::NONE, Key::Questionmark, Action::ShowShortcuts);
@@ -554,6 +570,32 @@ impl BibleApp {
         for a in actions {
             self.apply_one(ctx, a);
         }
+    }
+
+    /// Translation `id`'s text of chapter `c`: where chosen words are counted.
+    fn chapter_text(&self, id: &str, c: ChapterIdx) -> Option<Arc<bible_core::Translation>> {
+        match self.library.chapter(id, c) {
+            Chapter::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The colour all of the selection has (the chosen words, else the selected verses whole).
+    fn selection_color(&self) -> Option<HighlightColor> {
+        let (span, id) = match self.reader.text_span() {
+            Some((span, id)) => (span, id.to_string()),
+            None => {
+                let refs = self.reader.selected_refs();
+                (TextSpan::verses(*refs.first()?, *refs.last()?), self.settings.translation.clone())
+            }
+        };
+        let t = self.chapter_text(&id, span.first.chapter_idx());
+        self.study.span_color(&span, |r| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string()))
+    }
+
+    /// The verse whose note popover is open.
+    pub fn note_open(&self) -> Option<VerseRef> {
+        self.note_popover.as_ref().map(|n| n.verse)
     }
 
     fn selection_or_location(&self) -> Vec<VerseRef> {
@@ -662,11 +704,39 @@ impl BibleApp {
                 self.settings.parallel.retain(|p| *p != id);
             }
             Action::Highlight(color) => {
+                if color.is_some() {
+                    self.settings.last_highlight = color;
+                }
+                // Chosen words: just those, placed in the text they were chosen in.
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    let text = |r: VerseRef| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string());
+                    // Words across a passage leave its noted verses in their own colour.
+                    let passage = span.refs().len() > 1 && color.is_some();
+                    let study = &self.study;
+                    let keep: Vec<VerseRef> = span
+                        .refs()
+                        .into_iter()
+                        .filter(|r| passage && study.note(*r).is_some() && study.highlight(*r).is_some())
+                        .collect();
+                    if let Err(e) =
+                        self.study.highlight_span_keeping(&span, color, text, |r| keep.contains(&r))
+                    {
+                        self.toast(ctx, format!("Couldn't save highlight: {e:#}"));
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
                 }
+                // Colouring a passage leaves its noted verses in their own colour, so they stay
+                // visible over it. A single verse, or clearing, applies as asked.
+                let passage = refs.len() > 1 && color.is_some();
                 for r in &refs {
+                    if passage && self.study.note(*r).is_some() && self.study.highlight(*r).is_some() {
+                        continue;
+                    }
                     if let Err(e) = self.study.set_highlight(*r, color) {
                         self.toast(ctx, format!("Couldn't save highlight: {e:#}"));
                         break;
@@ -675,7 +745,14 @@ impl BibleApp {
             }
             Action::EditNote(v) => {
                 self.reader.set_selection(Some(v));
-                self.note_popover = Some(NotePopover::new(v, &self.study));
+                // A new note highlights its verse in the colour chosen last, else the newest
+                // highlight's, else the first.
+                let colour = self
+                    .settings
+                    .last_highlight
+                    .or_else(|| self.study.highlights_dated().first().map(|(_, h)| h.color))
+                    .unwrap_or(bible_core::study::HighlightColor::ALL[0]);
+                self.note_popover = Some(NotePopover::new(v, &self.study, colour));
             }
             Action::EditSelectedNote => {
                 let v = self.selection_or_location()[0];
@@ -694,8 +771,8 @@ impl BibleApp {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
-            Action::RemoveHighlight(v) => {
-                if let Err(e) = self.study.set_highlight(v, None) {
+            Action::RemoveHighlight(v, start) => {
+                if let Err(e) = self.study.remove_highlight(v, start) {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
@@ -708,6 +785,14 @@ impl BibleApp {
                 }
             }
             Action::CopyText => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::span_text(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if let Ok(t) = self.library.load(&self.settings.translation) {
                     let text: Vec<String> =
@@ -730,6 +815,14 @@ impl BibleApp {
                 }
             }
             Action::Copy => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::format_span(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied with reference");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -2438,9 +2531,10 @@ impl eframe::App for BibleApp {
                 }
             }
         }
+        let current = self.verse_menu.as_ref().and_then(|_| self.selection_color());
         if let Some(menu) = &mut self.verse_menu {
             let refs = self.reader.selected_refs();
-            if menu.show(&ctx, p, &self.study, &refs, &self.settings, &mut actions) {
+            if menu.show(&ctx, p, &self.study, &refs, current, &self.settings, &mut actions) {
                 self.verse_menu = None;
             }
         }

@@ -238,6 +238,9 @@ pub struct StudyItem {
     /// The verse in the translation asked for (empty if it hasn't the verse).
     pub text: String,
     pub highlight: Option<HighlightColor>,
+    /// Which of its verse's highlights a highlight is (where it starts; 0 for a whole verse), for
+    /// telling a verse's highlights apart and `remove_highlight`. 0 for notes and bookmarks.
+    pub start: u32,
     /// A note's text, or a bookmark's label.
     pub body: String,
     /// Unix seconds.
@@ -404,6 +407,11 @@ impl Bible {
         Ok(self.study().set_highlight(verse.core()?, color.map(Into::into))?)
     }
 
+    /// Removes one of a verse's highlights: the one a study item's `start` names.
+    pub fn remove_highlight(&self, verse: VerseRef, start: u32) -> Result<(), BibleError> {
+        Ok(self.study().remove_highlight(verse.core()?, start)?)
+    }
+
     pub fn note(&self, verse: VerseRef) -> Result<Option<String>, BibleError> {
         Ok(self.study().note(verse.core()?).map(|n| n.body.clone()))
     }
@@ -422,12 +430,14 @@ impl Bible {
     pub fn study_items(&self, kind: StudyKind, translation: String) -> Vec<StudyItem> {
         let t = self.local(&translation).ok();
         let study = self.study();
+        let text = |r| t.as_ref().and_then(|t| t.find(r)).map(|v| v.plain_text()).unwrap_or_default();
         let item = |r: bible_core::VerseRef, highlight, body: &str, created, updated| StudyItem {
             verse: r.into(),
             chapter_index: r.chapter_idx().0,
             reference: r.to_string(),
-            text: t.as_ref().and_then(|t| t.find(r)).map(|v| v.plain_text()).unwrap_or_default(),
+            text: text(r),
             highlight,
+            start: 0,
             body: body.to_string(),
             created,
             updated,
@@ -438,10 +448,18 @@ impl Bible {
                 .into_iter()
                 .map(|(r, b)| item(r, None, &b.label, b.created, b.created))
                 .collect(),
+            // Part of a verse shows the words it covers.
             StudyKind::Highlights => study
                 .highlights_dated()
                 .into_iter()
-                .map(|(r, c, at)| item(r, Some(c.into()), "", at, at))
+                .map(|(r, h)| {
+                    let mut it = item(r, Some(h.color.into()), "", h.created, h.created);
+                    if !h.is_whole() {
+                        it.text = h.excerpt(&it.text);
+                    }
+                    it.start = h.start;
+                    it
+                })
                 .collect(),
             StudyKind::Notes => study
                 .notes()

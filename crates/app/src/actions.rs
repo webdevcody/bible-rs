@@ -15,6 +15,13 @@ pub enum Action {
         verse: Option<u8>,
         flash: bool,
     },
+    /// Go to a search result and select its verse; only a search's first adds to the history,
+    /// so Back returns to where the search began.
+    JumpToResult {
+        chapter: ChapterIdx,
+        verse: u8,
+        history: bool,
+    },
     Back,
     Forward,
     PrevChapter,
@@ -36,7 +43,8 @@ pub enum Action {
     EditSelectedNote,
     ToggleBookmark,
     RemoveBookmark(VerseRef),
-    RemoveHighlight(VerseRef),
+    /// Removes one highlight of a verse: the one stored from that char.
+    RemoveHighlight(VerseRef, u32),
     RemoveNote(VerseRef),
     /// Save a note's text (an empty text removes it).
     SaveNote(VerseRef, String),

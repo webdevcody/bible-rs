@@ -68,6 +68,7 @@ typeset, searchable as you type, with highlights, notes and bookmarks kept on yo
 - Click a verse (⇧-click for a range, J/K to move) to select it, then: highlight in six colours
   (1–6, 0 to clear), write a note (N), bookmark (B / ⌘D), copy (⌘C, or ⇧⌘C with the reference)
   or compare translations (C). Right-click opens the verse menu with all of these.
+- Drag across words (in a verse or across verses) to highlight or copy just them.
 - Notes and bookmarks show in the margin; the Study sidebar lists everything.
 - Export to Markdown (⌘E) or JSON (⌘⇧E); JSON imports back.
 
@@ -171,6 +172,7 @@ chapter by chapter, and appear in parallel and compare views as their chapters l
 | ↑ ↓, Space, ⇧Space, PgUp/PgDn | Scroll |
 | ⌘[ / ⌘] (⌥← / ⌥→) | Back / forward |
 | Click, ⇧-click, J / K | Select a verse, a range, next / previous verse |
+| Drag, ⇧-click | Choose words, extend them |
 | 1–6, 0 | Highlight colour, remove highlight |
 | N · B or ⌘D · ⌘C · ⇧⌘C · C | Note · bookmark · copy · copy with reference · compare |
 | ⌘1…⌘9 | Switch translation |
@@ -180,6 +182,7 @@ chapter by chapter, and appear in parallel and compare views as their chapters l
 | ⌃⌘F | Focus mode |
 | ⌘B · ⌘, · ⌘/ | Sidebar · settings · shortcut help |
 | ⌘E · ⌘⇧E · ⌘I | Export Markdown · export JSON · import translation |
+| A · ⇧A | Ask about the selected verse · Bible chat (web reader) |
 
 ⌘/ shows them in the app:
 
@@ -381,6 +384,15 @@ WebAssembly. Every chapter of every bundled translation is also a static page
 (`/read/kjv/john/3`). [Importing](#import-a-translation-you-own) works as on the Mac, with the same
 formats, and the conversion runs in the browser. Study data, settings and imported translations
 stay in the browser. After one visit the reader works offline. Online translations are Mac-only.
+
+**Bible chat** (web only, bring your own OpenAI key): right-click a verse and choose *Ask About
+This Verse…*, or open the chat from the toolbar (✦, ⇧A) to talk about a chapter, a book, your
+notes, or anything ("find me a verse to help me stay motivated"). Replies stream in beside the
+text; every reference in them opens in the reader, and the passages cited are shown from your own
+translation. The model can search the Bible and read passages itself. Your key and your
+conversations stay in the browser, and requests go straight to OpenAI.
+
+![Bible chat beside John 3](docs/screenshots/chat/answer.png)
 
 The site is the SvelteKit app in `site/` ([site/README.md](site/README.md)):
 

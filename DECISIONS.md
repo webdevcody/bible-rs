@@ -133,6 +133,57 @@ mirrored in memory (hundreds of rows) so the reader can query it per verse every
 (including the reading position) are written at most every 1.5 s, so scrolling never waits on
 disk. Export to JSON (round-trips via import) and Markdown.
 
+## Highlights: whole verses, words, and stretches across verses
+
+A highlight can cover a whole verse, a few words of one, or a stretch across verses. The store
+keeps highlights per verse, and a verse can hold several. Each records the chars it covers in the
+verse's text (`start`, and `end`, which is empty when it runs to the verse's end) and, for part of a
+verse, the words themselves (`quote`). A stretch across verses is stored as the tail of the first
+verse, the middle verses whole, and the head of the last. Keeping everything per verse leaves
+lookups as they were (one map read per verse while painting) and lets each verse's highlights be
+merged on their own. The range logic is in `bible-core` (`highlight.rs`), so the Mac, web and phone
+apps can't disagree about it.
+
+**Offsets and translations.** Highlights are keyed by canonical reference and show in every
+translation, but char offsets only mean something in the text they were counted in. A highlight of
+part of a verse is placed in another text where its words are (ignoring spacing, the occurrence
+nearest its offset). John 3:16's "God so loved the world" lands on the same words in the KJV and
+the WEB. When the other translation words it differently, the highlight **falls back to the whole
+verse**, so it never disappears. Hiding it was the other choice; a highlight that vanishes on
+switching translation looks like lost data. When several fall back at once, the one coloured most
+recently is on top.
+
+**Overlaps.** Colouring over a highlight replaces it where they overlap, like a highlighter over a
+highlighter: the newest colour is on top, and the rest of the older one stays. Neighbours of one
+colour with only spaces between them join, keeping the earlier date. Each highlight keeps when it
+was made (what lists show) apart from when it was last coloured (what decides the top colour), so
+recolouring an old highlight puts it on top without moving it in the lists. Clearing part of a highlight
+leaves the rest. Edits are made against the text being read, so a verse that's edited is stored
+again in that text's offsets, exactly as it was shown. A highlight that had fallen back to the whole
+verse there becomes whole-verse.
+
+**Choosing words.** On the Mac and the web, clicking a verse selects it and shift-click extends to
+whole verses, as before. Dragging across text chooses words within one chapter, and shift-click
+carries that choice on. Keys 1 to 6, 0 and the verse menu act on the chosen words when there are
+some, and copying copies just them. Chosen words belong to the translation they were counted in:
+switching translation lets go of them and leaves their verses selected. The web uses the browser's
+own selection, so a touch screen gets
+a long press and its handles, plus a bar of swatches under the selection, since it has no number
+keys or right-click.
+
+**Migration.** The SQLite file's `user_version` goes from 0 to 1. The highlights table gains
+`char_start`, `char_end`, `quote` and `edited`, and `char_start` joins its key. The old rows are
+copied across as whole-verse highlights with their colour and date. JSON exports add `start`,
+`end` and `quote` only for parts of verses, and `edited` only when it differs from `created`, so older exports (and the web app's saved snapshots) import as
+whole verses, and an older app reading a newer export sees whole verses. An older app opening a
+migrated file still reads its highlights but can't save new ones.
+
+**The phone.** The iPhone app shares the store, so it migrates the same way and keeps every
+highlight, but it still draws and edits whole verses: part of a verse shows there as the whole
+verse in its colour. Its Highlights list has a row per highlight, and removing a row removes only
+that one. Choosing words needs hand-drawn selection handles over its custom text
+drawing, so it's left for later.
+
 ## macOS integration
 
 - Native menu bar via `muda` (`cfg(target_os = "macos")`). Menu items with key equivalents are
@@ -429,10 +480,28 @@ also a static page that search engines can index.
   also aren't all open to browsers (CORS). The web reader offers the bundled translations and
   files you import.
 
+### Bible chat: the reader's own key, straight to the provider
+
+The web reader can talk with a language model about a passage, a chapter, a book, notes, or
+anything ("find me a verse for…"). It runs on the reader's own OpenAI key, kept in
+`localStorage` and sent only to `api.openai.com`, which accepts calls from browsers. There's no
+proxy, account or server cost, and nothing about what someone asks passes through this site.
+
+- **Grounded in the reader's text.** The passage asked about goes in with its chapter (a book goes
+  in whole), and the model has two tools that run in the page against the core: `search_bible`
+  (the reader's own search) and `read_passage`. Replies write references as `[[John 3:16]]`; the
+  page links them and shows each cited passage from the reader's translation under the reply, so a
+  misquote is easy to catch.
+- **One conversation model, many contexts.** A context (verses, chapter, book, note, all notes,
+  general) names itself, gives its text and suggests questions; the panel, the Ask sheet, the verse
+  menu, the palette and the notes page all start conversations the same way.
+- **Chat Completions with streamed tool calls**, behind a small provider interface, so another
+  provider is one file. The default is a fast model (GPT-4.1 mini); others can be picked.
+
 ## What was traded away
 
-- No per-word highlighting (verse-level only) and no free text selection inside verses — verse
-  selection with "copy with reference" covers the common case.
+- Highlights of part of a verse fall back to the whole verse in a translation that words it
+  differently, and the iPhone app shows them whole-verse for now.
 - No footnotes or cross-references from the source texts (dropped at import).
 - SWORD modules in versifications other than KJV(A)/NRSV(A) (e.g. Vulgate, Synodal) aren't supported yet;
   deuterocanonical books are skipped everywhere to keep the 66-book grid.

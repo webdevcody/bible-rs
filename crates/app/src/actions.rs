@@ -36,7 +36,8 @@ pub enum Action {
     EditSelectedNote,
     ToggleBookmark,
     RemoveBookmark(VerseRef),
-    RemoveHighlight(VerseRef),
+    /// Removes one highlight of a verse: the one stored from that char.
+    RemoveHighlight(VerseRef, u32),
     RemoveNote(VerseRef),
     /// Save a note's text (an empty text removes it).
     SaveNote(VerseRef, String),
@@ -78,6 +79,8 @@ pub enum Action {
     SelectPrev,
     OpenPalette,
     OpenSearch(Option<String>),
+    /// Focus the open page's own field (/ on a page that shows one).
+    FocusPageSearch,
     /// Move to the next (1) or previous (-1) search result.
     SearchStep(i32),
     ClearSearch,

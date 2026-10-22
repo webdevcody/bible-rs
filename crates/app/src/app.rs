@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bible_core::books::{BookId, ChapterIdx, VerseRef};
-use bible_core::library::Library;
-use bible_core::study::StudyStore;
+use bible_core::library::{Chapter, Library};
+use bible_core::study::{HighlightColor, StudyStore, TextSpan};
 use eframe::egui::{self, Align2, Frame, Id, Key, Modifiers, Sense, Stroke, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
@@ -463,6 +463,12 @@ impl BibleApp {
         // The rows of Settings › Shortcuts, with any chords chosen there.
         let bindings = crate::keymap::bindings(&self.settings.shortcuts);
         let anywhere = |a: &Action| matches!(a, Action::OpenPalette | Action::OpenSearch(_));
+        // On a page with its own field, / filters the page; elsewhere it searches the Bible.
+        let slash = if !self.pages.reader() && self.pages.search.shown {
+            Action::FocusPageSearch
+        } else {
+            Action::OpenSearch(None)
+        };
         ctx.input_mut(|i| {
             let cmd = Modifiers::COMMAND;
             let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -537,7 +543,7 @@ impl BibleApp {
             key(Modifiers::NONE, Key::J, Action::SelectNext);
             key(Modifiers::NONE, Key::K, Action::SelectPrev);
             key(Modifiers::NONE, Key::Escape, Action::ClearSelection);
-            key(Modifiers::NONE, Key::Slash, Action::OpenSearch(None));
+            key(Modifiers::NONE, Key::Slash, slash);
             key(Modifiers::SHIFT, Key::Questionmark, Action::ShowShortcuts);
             key(Modifiers::NONE, Key::Questionmark, Action::ShowShortcuts);
             for (n, k) in
@@ -554,6 +560,27 @@ impl BibleApp {
         for a in actions {
             self.apply_one(ctx, a);
         }
+    }
+
+    /// Translation `id`'s text of chapter `c`: where chosen words are counted.
+    fn chapter_text(&self, id: &str, c: ChapterIdx) -> Option<Arc<bible_core::Translation>> {
+        match self.library.chapter(id, c) {
+            Chapter::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The colour all of the selection has (the chosen words, else the selected verses whole).
+    fn selection_color(&self) -> Option<HighlightColor> {
+        let (span, id) = match self.reader.text_span() {
+            Some((span, id)) => (span, id.to_string()),
+            None => {
+                let refs = self.reader.selected_refs();
+                (TextSpan::verses(*refs.first()?, *refs.last()?), self.settings.translation.clone())
+            }
+        };
+        let t = self.chapter_text(&id, span.first.chapter_idx());
+        self.study.span_color(&span, |r| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string()))
     }
 
     fn selection_or_location(&self) -> Vec<VerseRef> {
@@ -662,6 +689,15 @@ impl BibleApp {
                 self.settings.parallel.retain(|p| *p != id);
             }
             Action::Highlight(color) => {
+                // Chosen words: just those, placed in the text they were chosen in.
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    let text = |r: VerseRef| t.as_ref().and_then(|t| t.find(r)).map(|v| v.text.to_string());
+                    if let Err(e) = self.study.highlight_span(&span, color, text) {
+                        self.toast(ctx, format!("Couldn't save highlight: {e:#}"));
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -694,8 +730,8 @@ impl BibleApp {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
-            Action::RemoveHighlight(v) => {
-                if let Err(e) = self.study.set_highlight(v, None) {
+            Action::RemoveHighlight(v, start) => {
+                if let Err(e) = self.study.remove_highlight(v, start) {
                     self.toast(ctx, format!("{e:#}"));
                 }
             }
@@ -708,6 +744,14 @@ impl BibleApp {
                 }
             }
             Action::CopyText => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::span_text(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if let Ok(t) = self.library.load(&self.settings.translation) {
                     let text: Vec<String> =
@@ -730,6 +774,14 @@ impl BibleApp {
                 }
             }
             Action::Copy => {
+                if let Some((span, id)) = self.reader.text_span() {
+                    let t = self.chapter_text(id, span.first.chapter_idx());
+                    if let Some(text) = t.and_then(|t| bible_core::copy::format_span(&t, &span)) {
+                        ctx.copy_text(text);
+                        self.toast(ctx, "Copied with reference");
+                    }
+                    return;
+                }
                 let refs = self.reader.selected_refs();
                 if refs.is_empty() {
                     return;
@@ -781,6 +833,7 @@ impl BibleApp {
                 self.settings.sidebar_tab = SidebarTab::Search;
                 self.sidebar.focus_search(q);
             }
+            Action::FocusPageSearch => self.pages.search.focus(),
             Action::ToggleSidebar => self.settings.sidebar_open = !self.settings.sidebar_open,
             Action::SidebarTab(t) => {
                 self.settings.sidebar_open = true;
@@ -1275,27 +1328,8 @@ impl BibleApp {
         }
         items.push(nav_rect);
 
-        // On a page: a wider field that filters it, and nothing else.
+        // On a page: nothing else. Its own field sits over the list it filters (pages::PageSearch).
         if !self.pages.reader() {
-            let w = PAGE_SEARCH_WIDTH;
-            let search = egui::Rect::from_min_size(
-                egui::pos2(bar.right() - TRAILING_INSET - w, cy - CAPSULE_HEIGHT / 2.0),
-                vec2(w, CAPSULE_HEIGHT),
-            );
-            let placeholder = self.pages.page.placeholder();
-            let (field, cleared) = widgets::search_field(
-                ui,
-                search,
-                p,
-                &mut self.pages.query,
-                placeholder,
-                Id::new("page-search"),
-            );
-            if cleared || (field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape))) {
-                self.pages.query.clear();
-                field.surrender_focus();
-            }
-            items.push(search);
             #[cfg(target_os = "macos")]
             self.toolbar_items.extend(items);
             return;
@@ -1904,9 +1938,6 @@ const COMPACT_TOOLBAR: f32 = 760.0;
 const TEXT_POPUP: &str = "text-popover";
 const MORE_POPUP: &str = "more-menu";
 
-/// The toolbar's field on pages (it filters the page).
-const PAGE_SEARCH_WIDTH: f32 = 200.0;
-
 /// Under the toolbar in parallel: the columns' heads (16 pt down, 34 tall, 16 pt to a hairline).
 const COLUMN_HEADS: f32 = 66.0;
 
@@ -2282,7 +2313,7 @@ impl eframe::App for BibleApp {
             self.main_area = full;
             // A page in the reader's place, under the same toolbar.
             if !self.pages.reader() {
-                let query = self.pages.query.clone();
+                let query = self.pages.search.query.clone();
                 let env = crate::pages::PageEnv {
                     library: &self.library,
                     study: &self.study,
@@ -2438,9 +2469,10 @@ impl eframe::App for BibleApp {
                 }
             }
         }
+        let current = self.verse_menu.as_ref().and_then(|_| self.selection_color());
         if let Some(menu) = &mut self.verse_menu {
             let refs = self.reader.selected_refs();
-            if menu.show(&ctx, p, &self.study, &refs, &self.settings, &mut actions) {
+            if menu.show(&ctx, p, &self.study, &refs, current, &self.settings, &mut actions) {
                 self.verse_menu = None;
             }
         }

@@ -17,6 +17,11 @@ export class Bible {
      */
     clearReading(since: number): void;
     /**
+     * Words chosen in `translation` for the clipboard: "plain" (just the words) or "reference"
+     * (`“so loved the world” — John 3:16 (KJV)`). Null when the translation hasn't them.
+     */
+    copySpan(translation: string, span: any, format: string): string | undefined;
+    /**
      * Verses as text for the clipboard or a share sheet. `format` is "plain" (the verses
      * joined), "reference" (`“text” — John 3:16 (KJV)`, or a reference line and numbered verses
      * for several) or "markdown" (a quote with its reference). Null when none of the verses are
@@ -44,10 +49,22 @@ export class Bible {
      */
     has(translation: string): boolean;
     /**
+     * Colours a stretch of text as read in `translation` (`{first, start, last, end}`, UTF-16
+     * offsets into the verse texts), or with null clears it: over the highlights there, which it
+     * replaces where they overlap.
+     */
+    highlightSpan(translation: string, span: any, color?: string | null): void;
+    /**
      * Merges a JSON export in (entries for the same verse are overwritten); returns how many
      * highlights, notes and bookmarks it held.
      */
     importStudy(json: string): any;
+    /**
+     * Keeps one chapter of the NLT, read from the HTML Tyndale's API returned (through the site's
+     * `/api/nlt`), in place of any chapter of it kept before: Tyndale's terms allow quoting up to
+     * 500 verses and never a whole book, so the page holds one chapter at a time and stores none.
+     */
+    loadNlt(index: number, html: string): any;
     /**
      * Decodes a `.bbl` file (≈10 ms for a whole Bible) and keeps it under its id, which is
      * returned with its metadata.
@@ -81,6 +98,10 @@ export class Bible {
      */
     recordReading(session: any): void;
     /**
+     * Removes one highlight of a verse: the one a study item's `start` names.
+     */
+    removeHighlight(verse: any, start: number): void;
+    /**
      * Replaces the study store with a `snapshot`.
      */
     restore(json: string): void;
@@ -110,6 +131,10 @@ export class Bible {
      */
     snapshot(): string;
     /**
+     * The colour every letter of a stretch of text has, if one does.
+     */
+    spanColor(translation: string, span: any): string | undefined;
+    /**
      * Starts (or restarts) a plan on the day containing `started`, forgetting earlier progress.
      */
     startPlan(id: string, started: number): void;
@@ -123,6 +148,10 @@ export class Bible {
      * Bookmarks a verse or removes its bookmark; returns whether it's bookmarked now.
      */
     toggleBookmark(verse: any): boolean;
+    /**
+     * Lets a translation go (the NLT's chapter, once the reader moves on).
+     */
+    unload(translation: string): void;
     /**
      * One verse as a paragraph, or null when the translation hasn't it (comparisons).
      */
@@ -204,6 +233,7 @@ export interface InitOutput {
     readonly __wbg_bible_free: (a: number, b: number) => void;
     readonly bible_chapter: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly bible_clearReading: (a: number, b: number, c: number) => void;
+    readonly bible_copySpan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly bible_copyText: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly bible_counts: (a: number, b: number) => void;
     readonly bible_eraseStudy: (a: number, b: number) => void;
@@ -211,8 +241,10 @@ export interface InitOutput {
     readonly bible_finishPlan: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly bible_generation: (a: number) => number;
     readonly bible_has: (a: number, b: number, c: number) => number;
+    readonly bible_highlightSpan: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly bible_importStudy: (a: number, b: number, c: number, d: number) => void;
     readonly bible_load: (a: number, b: number, c: number, d: number) => void;
+    readonly bible_loadNlt: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_marks: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_new: () => number;
     readonly bible_note: (a: number, b: number, c: number) => void;
@@ -221,6 +253,7 @@ export interface InitOutput {
     readonly bible_prepareSearch: (a: number, b: number, c: number, d: number) => void;
     readonly bible_readingSince: (a: number, b: number, c: number) => void;
     readonly bible_recordReading: (a: number, b: number, c: number) => void;
+    readonly bible_removeHighlight: (a: number, b: number, c: number, d: number) => void;
     readonly bible_restore: (a: number, b: number, c: number, d: number) => void;
     readonly bible_search: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
     readonly bible_setBookmark: (a: number, b: number, c: number, d: number, e: number) => void;
@@ -228,10 +261,12 @@ export interface InitOutput {
     readonly bible_setNote: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_setPlanRead: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly bible_snapshot: (a: number, b: number) => void;
+    readonly bible_spanColor: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_startPlan: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_stopPlan: (a: number, b: number, c: number, d: number) => void;
     readonly bible_studyItems: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly bible_toggleBookmark: (a: number, b: number, c: number) => void;
+    readonly bible_unload: (a: number, b: number, c: number) => void;
     readonly bible_verse: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly bible_verses: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly books: (a: number) => void;

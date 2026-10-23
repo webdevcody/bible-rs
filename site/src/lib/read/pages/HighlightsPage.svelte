@@ -36,7 +36,7 @@
 		if (all.length === 1) return '1 highlight';
 		return `${all.length} highlights in ${books.length} ${books.length === 1 ? 'book' : 'books'}`;
 	});
-	const abbrev = $derived(app.info(app.settings.translation)?.abbrev ?? '');
+	const abbrev = $derived(app.info(app.textTranslation())?.abbrev ?? '');
 
 	const scoped = $derived.by(() => {
 		const q = app.pageQuery.trim().toLowerCase();
@@ -124,7 +124,7 @@
 	</div>
 
 	<div class="cards" bind:clientWidth={width} style:height="{layout.height}px">
-		{#each layout.cards as { h, text, x, y, height } (h.reference)}
+		{#each layout.cards as { h, text, x, y, height } (`${h.reference}:${h.start}`)}
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<div
 				class="card"
@@ -164,7 +164,7 @@
 			label="Remove Highlight"
 			onclick={() => {
 				menu = null;
-				app.dispatch({ type: 'removeHighlight', verse: m.item.verse });
+				app.dispatch({ type: 'removeHighlight', verse: m.item.verse, start: m.item.start });
 			}}
 		/>
 	</Menu>

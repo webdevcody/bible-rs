@@ -4,9 +4,11 @@
 	design points at a 20 pt reading size, scaled by --u.
 -->
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+	import { glyphsIn, type Glyph } from '../../objects/glyphs';
 	import type { Block, ChapterContent, HighlightColor, Run, VerseMarks } from '../core';
 	import Icon from '../ui/Icon.svelte';
-	import { runClass, segments } from './segments';
+	import { runClass, segments, washes, type Piece, type Wash } from './segments';
 
 	interface Props {
 		index: number;
@@ -23,10 +25,27 @@
 		quiet: boolean;
 		redLetters: boolean;
 		justify: boolean;
+		/** The chapter in the address: its verses are the targets of #v16 links. */
+		anchors: boolean;
+		/** Under the text (a live translation's credit line). */
+		footer?: Snippet;
 	}
 
-	let { index, content, label, abbrev, marks, selected, flash, noteOpen, quiet, redLetters, justify }: Props =
-		$props();
+	let {
+		index,
+		content,
+		label,
+		abbrev,
+		marks,
+		selected,
+		flash,
+		noteOpen,
+		quiet,
+		redLetters,
+		justify,
+		anchors,
+		footer
+	}: Props = $props();
 
 	const PSALMS = 18;
 
@@ -34,6 +53,18 @@
 		if (content?.status.type !== 'ready') return [];
 		const seen = new Set<number>();
 		return content.blocks.map((block) => ({ block, segs: segments(block, seen) }));
+	});
+
+	/** Verses that describe a modelled object (the Ark), by verse. */
+	const glyphs = $derived(glyphsIn(index));
+	/** Where each of those verses ends ("block:segment"): its glyph follows its last words. */
+	const glyphAt = $derived.by(() => {
+		const at = new Map<string, Glyph>();
+		if (!glyphs) return at;
+		const last = new Map<number, string>();
+		blocks.forEach(({ segs }, i) => segs.forEach((s, j) => glyphs.has(s.verse) && last.set(s.verse, `${i}:${j}`)));
+		for (const [verse, key] of last) at.set(key, glyphs.get(verse)!);
+		return at;
 	});
 
 	const message = $derived(
@@ -72,10 +103,21 @@
 
 	const level = (b: Block) => (b.kind.type === 'poetry' ? b.kind.level : 0);
 	const hl = (c: HighlightColor | null | undefined) => (c ? `var(--hl-${c})` : undefined);
+	/** A verse's part of a block in one colour throughout takes the verse's own wash. */
+	const whole = (ws: Wash[]) => (ws.length === 1 ? ws[0].color : null);
 </script>
 
 {#snippet run(r: Run)}{@const c = runClass(r, redLetters)}{#if c}<span class={c}>{r.text}</span
 		>{:else}{r.text}{/if}{/snippet}
+
+{#snippet piece(p: Piece)}<span class={p.cls || undefined} data-o={p.added ? undefined : p.offset}>{p.text}</span
+	>{/snippet}
+
+<!-- Parts of the verse in other colours wash only their words. -->
+{#snippet text(ws: Wash[])}{#each ws as w, i (i)}{#if w.color && ws.length > 1}<span
+				class="h"
+				style:--hl={hl(w.color)}>{#each w.pieces as p, k (k)}{@render piece(p)}{/each}</span
+			>{:else}{#each w.pieces as p, k (k)}{@render piece(p)}{/each}{/if}{/each}{/snippet}
 
 <section class="chapter" class:justify data-chapter={index} class:message={!!message}>
 	{#if quiet}
@@ -110,8 +152,13 @@
 			>{#if block.gutter}<span class="gutter" data-v={block.gutterVerse}>{block.gutter}</span
 					>{/if}{#each segs as seg, j (j)}{#if seg.verse === 0}{#each seg.runs as r, k (k)}{@render run(
 								r
-							)}{/each}{:else}{@const m = marks.get(seg.verse)}<span
+							)}{/each}{:else}{@const m = marks.get(seg.verse)}{@const ws = washes(
+								seg.runs,
+								m?.highlights ?? [],
+								redLetters
+							)}<span
 							class="seg"
+							id={anchors && seg.start ? `v${seg.verse}` : undefined}
 							data-v={seg.verse}
 							data-vs={seg.start ? '' : undefined}
 							>{#if seg.start && (m?.bookmark || m?.note || noteOpen === seg.verse)}<span class="markers"
@@ -134,11 +181,18 @@
 								class="v"
 								class:sel={selected.has(seg.verse)}
 								class:flash={flash === seg.verse}
-								style:--hl={hl(m?.highlight)}
-								>{#each seg.runs as r, k (k)}{@render run(r)}{/each}</span
-							>{seg.trail}</span
+								style:--hl={hl(whole(ws))}
+								>{@render text(ws)}</span
+							>{#if glyphAt.get(`${i}:${j}`)}{@const g = glyphAt.get(`${i}:${j}`)!}<a
+									class="glyph"
+									href={g.href}
+									data-sveltekit-reload
+									title={g.label}
+									aria-label={g.label}><Icon name="cube" size={18} /></a
+								>{/if}{seg.trail}</span
 						>{/if}{/each}</p>
 		{/each}
+		{@render footer?.()}
 	{/if}
 </section>
 
@@ -342,6 +396,17 @@
 		--sel: var(--selection);
 	}
 
+	/* Part of a verse in its own colour: the same wash over just its words (the selection's over it). */
+	.h {
+		background-image: linear-gradient(var(--sel), var(--sel)), linear-gradient(var(--hl), var(--hl));
+		background-size: 100% calc(100% - 0.085em);
+		background-position: 0 50%;
+		background-repeat: no-repeat;
+		border-radius: 4px;
+		-webkit-box-decoration-break: clone;
+		box-decoration-break: clone;
+	}
+
 	.v.flash {
 		animation: flash 2.2s linear forwards;
 	}
@@ -384,6 +449,24 @@
 	}
 
 	.marker.open {
+		background: var(--accent-soft);
+	}
+
+	/* An object modelled in 3D: an 18 pt cube after the verse, in the accent colour. */
+	.glyph {
+		display: inline-grid;
+		place-items: center;
+		width: 24px;
+		height: 24px;
+		margin-left: 2px;
+		border-radius: 6px;
+		vertical-align: -5px;
+		color: var(--accent);
+		text-indent: 0;
+		transition: background-color var(--motion-fast);
+	}
+
+	.glyph:hover {
 		background: var(--accent-soft);
 	}
 </style>
